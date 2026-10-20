@@ -1,11 +1,9 @@
-
 name: RDP
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   secure-rdp:
@@ -13,33 +11,31 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Configure RDP and Display Access
+      - name: Configure RDP
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Validate repository secret
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              throw "Add RDP_PASSWORD under Settings > Secrets and variables > Actions."
+              throw "Set the RDP_PASSWORD repository secret."
           }
 
-          # Find Tailscale
+          # Check Tailscale
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (-not (Test-Path $tsExe)) {
-              throw "Tailscale is not installed on this Windows machine."
+              throw "Tailscale is not installed."
           }
 
-          # Get the connected Tailscale IPv4 address
           $ip = (& $tsExe ip -4 | Select-Object -First 1).Trim()
 
           if (-not $ip) {
               throw "Tailscale is not connected."
           }
 
-          # Enable RDP while keeping Network Level Authentication enabled
+          # Enable Remote Desktop; keep NLA enabled
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
@@ -48,11 +44,12 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 1 -Force
 
-          # Create or update the RDP account
+          # Create or update the RDP user
           $securePass = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
-          $user = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name 'RDP' `
+            -ErrorAction SilentlyContinue
 
           if ($user) {
               Set-LocalUser -Name 'RDP' -Password $securePass
@@ -64,31 +61,26 @@ jobs:
                 -Password $securePass `
                 -AccountNeverExpires `
                 -PasswordNeverExpires `
-                -Description 'Remote Desktop account'
+                -Description 'Remote Desktop user'
           }
 
-          # Add account to Remote Desktop Users
-          $rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
-          $rdpUser = Get-LocalUser -Name 'RDP'
-
+          # Add the user to Remote Desktop Users
+          $group = Get-LocalGroup -SID 'S-1-5-32-555'
+          $user = Get-LocalUser -Name 'RDP'
           $members = @(
-              Get-LocalGroupMember -Group $rdpGroup.Name `
+              Get-LocalGroupMember -Group $group.Name `
                 -ErrorAction SilentlyContinue
           )
 
           if (-not ($members | Where-Object {
-              $_.SID.Value -eq $rdpUser.SID.Value
+              $_.SID.Value -eq $user.SID.Value
           })) {
               Add-LocalGroupMember `
-                -Group $rdpGroup.Name `
+                -Group $group.Name `
                 -Member 'RDP'
           }
 
-          # Restrict RDP firewall access to the Tailscale IPv4 range
-          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' `
-            -ErrorAction SilentlyContinue |
-            Disable-NetFirewallRule
-
+          # Allow RDP only from Tailscale IPv4 addresses
           Get-NetFirewallRule -DisplayName 'RDP-Tailscale-only' `
             -ErrorAction SilentlyContinue |
             Remove-NetFirewallRule
@@ -102,24 +94,22 @@ jobs:
             -Action Allow `
             -Profile Any
 
-          # Start the Remote Desktop service
           Set-Service -Name TermService -StartupType Automatic
 
-          $service = Get-Service -Name TermService
-          if ($service.Status -ne 'Running') {
+          if ((Get-Service TermService).Status -ne 'Running') {
               Start-Service -Name TermService
           }
 
-          # Build Kali Linux command
+          # Kali Linux command: full screen, password prompt
           $rdpCommand = "xfreerdp3 /v:$ip /u:RDP /f /dynamic-resolution"
 
           Write-Host ""
           Write-Host "========== RDP ACCESS =========="
           Write-Host "Address:  $ip"
           Write-Host "Username: RDP"
-          Write-Host "Password: Stored in GitHub secret RDP_PASSWORD"
+          Write-Host "Password: Configured in secret RDP_PASSWORD"
           Write-Host ""
-          Write-Host "Kali Linux full-screen command:"
+          Write-Host "Kali Linux command:"
           Write-Host $rdpCommand
           Write-Host "================================"
 
@@ -128,7 +118,7 @@ jobs:
 
           - Address: $ip
           - Username: RDP
-          - Password: Set in repository secret `RDP_PASSWORD`
+          - Password: Stored in repository secret `RDP_PASSWORD`
 
           ### Kali Linux — Full Screen
 
@@ -136,5 +126,5 @@ jobs:
           $rdpCommand
           ````
 
-          Enter the password when FreeRDP prompts you.
+          Enter the secret password when prompted.
           "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
