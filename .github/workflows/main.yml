@@ -1,30 +1,140 @@
-      - name: RDP
+
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+
+    steps:
+      - name: Configure RDP and Display Access
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $ip = $env:TAILSCALE_IP.Trim()
-          $password = $env:RDP_PASSWORD
-
-          if (-not $ip -or -not $password) {
-              throw "RDP IP or password is missing."
+          # Validate repository secret
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "Add RDP_PASSWORD under Settings > Secrets and variables > Actions."
           }
 
-          # Safely quote the password for Kali Bash
-          $bashPassword = $password.Replace("'", "'\''")
+          # Find Tailscale
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          $rdpCommand = "xfreerdp3 /v:$ip /u:RDP /p:'$bashPassword' /f -decorations /cert:ignore"
+          if (-not (Test-Path $tsExe)) {
+              throw "Tailscale is not installed on this Windows machine."
+          }
+
+          # Get the connected Tailscale IPv4 address
+          $ip = (& $tsExe ip -4 | Select-Object -First 1).Trim()
+
+          if (-not $ip) {
+              throw "Tailscale is not connected."
+          }
+
+          # Enable RDP while keeping Network Level Authentication enabled
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Force
+
+          # Create or update the RDP account
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+
+          if ($user) {
+              Set-LocalUser -Name 'RDP' -Password $securePass
+              Enable-LocalUser -Name 'RDP'
+          }
+          else {
+              New-LocalUser `
+                -Name 'RDP' `
+                -Password $securePass `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -Description 'Remote Desktop account'
+          }
+
+          # Add account to Remote Desktop Users
+          $rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
+          $rdpUser = Get-LocalUser -Name 'RDP'
+
+          $members = @(
+              Get-LocalGroupMember -Group $rdpGroup.Name `
+                -ErrorAction SilentlyContinue
+          )
+
+          if (-not ($members | Where-Object {
+              $_.SID.Value -eq $rdpUser.SID.Value
+          })) {
+              Add-LocalGroupMember `
+                -Group $rdpGroup.Name `
+                -Member 'RDP'
+          }
+
+          # Restrict RDP firewall access to the Tailscale IPv4 range
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-only' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale-only' `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Action Allow `
+            -Profile Any
+
+          # Start the Remote Desktop service
+          Set-Service -Name TermService -StartupType Automatic
+
+          $service = Get-Service -Name TermService
+          if ($service.Status -ne 'Running') {
+              Start-Service -Name TermService
+          }
+
+          # Build Kali Linux command
+          $rdpCommand = "xfreerdp3 /v:$ip /u:RDP /f /dynamic-resolution"
 
           Write-Host ""
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address: $ip"
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "Address:  $ip"
           Write-Host "Username: RDP"
-          Write-Host "Password: [configured]"
+          Write-Host "Password: Stored in GitHub secret RDP_PASSWORD"
           Write-Host ""
-          Write-Host "Copy this command to Kali Linux:"
+          Write-Host "Kali Linux full-screen command:"
           Write-Host $rdpCommand
-          Write-Host "=================="
+          Write-Host "================================"
 
-          while ($true) {
-              Start-Sleep -Seconds 300
-          }
+          @"
+          ## RDP ACCESS
+
+          - Address: $ip
+          - Username: RDP
+          - Password: Set in repository secret `RDP_PASSWORD`
+
+          ### Kali Linux — Full Screen
+
+          ````bash
+          $rdpCommand
+          ````
+
+          Enter the password when FreeRDP prompts you.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
