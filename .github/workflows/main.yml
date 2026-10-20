@@ -3,128 +3,111 @@ name: RDP
 on:
   workflow_dispatch:
 
-permissions: {}
-
 jobs:
   secure-rdp:
-    runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 10
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Configure RDP
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Configure Core RDP Settings
         run: |
-          $ErrorActionPreference = "Stop"
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              throw "Set the RDP_PASSWORD repository secret."
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          # Check Tailscale
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          if (-not (Test-Path $tsExe)) {
-              throw "Tailscale is not installed."
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-          $ip = (& $tsExe ip -4 | Select-Object -First 1).Trim()
-
-          if (-not $ip) {
-              throw "Tailscale is not connected."
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
-
-          # Enable Remote Desktop; keep NLA enabled
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0 -Force
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' -Value 1 -Force
-
-          # Create or update the RDP user
-          $securePass = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
-
-          $user = Get-LocalUser -Name 'RDP' `
-            -ErrorAction SilentlyContinue
-
-          if ($user) {
-              Set-LocalUser -Name 'RDP' -Password $securePass
-              Enable-LocalUser -Name 'RDP'
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
-          else {
-              New-LocalUser `
-                -Name 'RDP' `
-                -Password $securePass `
-                -AccountNeverExpires `
-                -PasswordNeverExpires `
-                -Description 'Remote Desktop user'
-          }
+          Write-Host "TCP connectivity successful!"
 
-          # Add the user to Remote Desktop Users
-          $group = Get-LocalGroup -SID 'S-1-5-32-555'
-          $user = Get-LocalUser -Name 'RDP'
-          $members = @(
-              Get-LocalGroupMember -Group $group.Name `
-                -ErrorAction SilentlyContinue
-          )
-
-          if (-not ($members | Where-Object {
-              $_.SID.Value -eq $user.SID.Value
-          })) {
-              Add-LocalGroupMember `
-                -Group $group.Name `
-                -Member 'RDP'
-          }
-
-          # Allow RDP only from Tailscale IPv4 addresses
-          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-only' `
-            -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-
-          New-NetFirewallRule `
-            -DisplayName 'RDP-Tailscale-only' `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress '100.64.0.0/10' `
-            -Action Allow `
-            -Profile Any
-
-          Set-Service -Name TermService -StartupType Automatic
-
-          if ((Get-Service TermService).Status -ne 'Running') {
-              Start-Service -Name TermService
-          }
-
-          # Kali Linux command: full screen, password prompt
-          $rdpCommand = "xfreerdp3 /v:$ip /u:RDP /f /dynamic-resolution"
-
-          Write-Host ""
-          Write-Host "========== RDP ACCESS =========="
-          Write-Host "Address:  $ip"
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: Configured in secret RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "Kali Linux command:"
-          Write-Host $rdpCommand
-          Write-Host "================================"
-
-          @"
-          ## RDP ACCESS
-
-          - Address: $ip
-          - Username: RDP
-          - Password: Stored in repository secret `RDP_PASSWORD`
-
-          ### Kali Linux — Full Screen
-
-          ````bash
-          $rdpCommand
-          ````
-
-          Enter the secret password when prompted.
-          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
