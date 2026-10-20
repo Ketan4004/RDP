@@ -1,4 +1,4 @@
-      - name: Maintain Connection
+      - name: RDP
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
